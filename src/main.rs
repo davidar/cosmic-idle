@@ -74,7 +74,7 @@ async fn receive_battery_task(sender: EventSender) -> zbus::Result<()> {
 #[derive(Debug)]
 struct Output {
     output: wl_output::WlOutput,
-    output_power: zwlr_output_power_v1::ZwlrOutputPowerV1,
+    output_power: Option<zwlr_output_power_v1::ZwlrOutputPowerV1>,
     fade_surface: Option<FadeBlackSurface>,
     global_name: u32,
 }
@@ -82,7 +82,7 @@ struct Output {
 // Immutate references to globals, needed for calls
 struct StateInner {
     registry: wl_registry::WlRegistry,
-    output_power_manager: zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1,
+    output_power_manager: Option<zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1>,
     compositor: wl_compositor::WlCompositor,
     layer_shell: zwlr_layer_shell_v1::ZwlrLayerShellV1,
     viewporter: wp_viewporter::WpViewporter,
@@ -128,10 +128,11 @@ impl State {
             .inner
             .registry
             .bind(global_name, version.min(3), &self.inner.qh, ());
-        let output_power =
-            self.inner
-                .output_power_manager
-                .get_output_power(&output, &self.inner.qh, ());
+        let output_power = self
+            .inner
+            .output_power_manager
+            .as_ref()
+            .map(|manager| manager.get_output_power(&output, &self.inner.qh, ()));
         self.outputs.push(Output {
             output,
             output_power,
@@ -146,7 +147,9 @@ impl State {
                 output.fade_surface = Some(FadeBlackSurface::new(&self.inner, &output.output));
             } else {
                 output.fade_surface = None;
-                output.output_power.set_mode(zwlr_output_power_v1::Mode::On);
+                if let Some(output_power) = &output.output_power {
+                    output_power.set_mode(zwlr_output_power_v1::Mode::On);
+                }
             }
         }
     }
@@ -154,9 +157,9 @@ impl State {
     // Fade surfaces on all outputs have finished fading out
     fn fade_done(&mut self) {
         for output in &mut self.outputs {
-            output
-                .output_power
-                .set_mode(zwlr_output_power_v1::Mode::Off);
+            if let Some(output_power) = &output.output_power {
+                output_power.set_mode(zwlr_output_power_v1::Mode::Off);
+            }
             output.fade_surface = None;
         }
 
@@ -238,9 +241,18 @@ fn main() {
     let (globals, event_queue) = registry_queue_init::<State>(&connection).unwrap();
     let qh = event_queue.handle();
 
+    // Optional: not every compositor offers wlr-output-power-management
+    // (niri doesn't). Without it, screen-off is the fade-to-black surface
+    // only; idle lock and suspend work regardless.
     let output_power_manager = globals
         .bind::<zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1, _, _>(&qh, 1..=1, ())
-        .unwrap();
+        .inspect_err(|err| {
+            log::warn!(
+                "no zwlr-output-power-management global; screens will not power off on idle: {}",
+                err
+            )
+        })
+        .ok();
 
     let idle_notifier = globals
         .bind::<ext_idle_notifier_v1::ExtIdleNotifierV1, _, _>(&qh, 1..=1, ())
