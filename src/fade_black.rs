@@ -1,10 +1,16 @@
 // Layer shell surface that fades to black, before setting DPMS off.
 
 use keyframe::{ease, functions::EaseInOut};
-use std::time::{Duration, Instant};
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    os::fd::AsFd,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use wayland_client::{
     Connection, Dispatch, QueueHandle, delegate_noop,
-    protocol::{wl_buffer, wl_callback, wl_output, wl_pointer, wl_surface},
+    protocol::{wl_buffer, wl_callback, wl_output, wl_pointer, wl_shm, wl_shm_pool, wl_surface},
 };
 use wayland_protocols::wp::{
     single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1,
@@ -64,16 +70,57 @@ impl FadeBlackSurface {
     pub fn update(&self, inner: &StateInner) {
         let time = self.started.elapsed().as_secs_f64() / FADE_TIME.as_secs_f64();
         let alpha = ease(EaseInOut, 0., u32::MAX as f64, time) as u32;
-        let buffer =
-            inner
-                .single_pixel_buffer_manager
-                .create_u32_rgba_buffer(0, 0, 0, alpha, &inner.qh, ());
+        let buffer = match &inner.single_pixel_buffer_manager {
+            Some(manager) => manager.create_u32_rgba_buffer(0, 0, 0, alpha, &inner.qh, ()),
+            None => match shm_black_pixel(inner, alpha) {
+                Ok(buffer) => buffer,
+                Err(err) => {
+                    log::error!("failed to create fade-to-black buffer: {}", err);
+                    return;
+                }
+            },
+        };
         self.surface.attach(Some(&buffer), 0, 0);
         self.surface.frame(&inner.qh, self.surface.clone());
         self.surface.damage(0, 0, i32::MAX, i32::MAX);
         self.surface.commit();
         buffer.destroy();
     }
+}
+
+// Fallback for compositors without wp-single-pixel-buffer (niri): a 1x1
+// ARGB8888 wl_shm buffer holding the same premultiplied black pixel. The
+// viewport scales it to the output exactly like the single-pixel buffer.
+fn shm_black_pixel(inner: &StateInner, alpha: u32) -> std::io::Result<wl_buffer::WlBuffer> {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = dir.join(format!("cosmic-idle-fade-{}", std::process::id()));
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)?;
+    // The descriptor is the only handle anyone needs; a fresh file per frame
+    // keeps the compositor's mapping of the previous one untouched.
+    let _ = std::fs::remove_file(&path);
+    let pixel = [0u8, 0, 0, (alpha >> 24) as u8]; // little-endian ARGB: B, G, R, A
+    file.write_all(&pixel)?;
+    let pool = inner
+        .shm
+        .create_pool(file.as_fd(), pixel.len() as i32, &inner.qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        1,
+        1,
+        pixel.len() as i32,
+        wl_shm::Format::Argb8888,
+        &inner.qh,
+        (),
+    );
+    pool.destroy();
+    Ok(buffer)
 }
 
 impl Drop for FadeBlackSurface {
@@ -179,3 +226,5 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
 delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore wl_surface::WlSurface);
 delegate_noop!(State: wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1);
+delegate_noop!(State: ignore wl_shm::WlShm);
+delegate_noop!(State: wl_shm_pool::WlShmPool);
