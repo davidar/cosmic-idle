@@ -11,7 +11,7 @@ use upower_dbus::UPowerProxy;
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
     globals::{GlobalListContents, registry_queue_init},
-    protocol::{wl_compositor, wl_output, wl_registry, wl_seat},
+    protocol::{wl_compositor, wl_output, wl_registry, wl_seat, wl_shm},
 };
 use wayland_protocols::{
     ext::idle_notify::v1::client::{ext_idle_notification_v1, ext_idle_notifier_v1},
@@ -86,7 +86,9 @@ struct StateInner {
     compositor: wl_compositor::WlCompositor,
     layer_shell: zwlr_layer_shell_v1::ZwlrLayerShellV1,
     viewporter: wp_viewporter::WpViewporter,
-    single_pixel_buffer_manager: wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1,
+    single_pixel_buffer_manager:
+        Option<wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1>,
+    shm: wl_shm::WlShm,
     idle_notifier: ext_idle_notifier_v1::ExtIdleNotifierV1,
     seat: wl_seat::WlSeat,
     qh: QueueHandle<State>,
@@ -152,6 +154,23 @@ impl State {
                 }
             }
         }
+        if !is_idle {
+            self.niri_set_monitors_power(true);
+        }
+    }
+
+    // Without wlr-output-power-management, fall back to the compositor's own
+    // IPC where one exists: niri exposes the same DPMS switch as an action.
+    fn niri_set_monitors_power(&self, on: bool) {
+        if self.inner.output_power_manager.is_some() || std::env::var_os("NIRI_SOCKET").is_none() {
+            return;
+        }
+        let action = if on {
+            "power-on-monitors"
+        } else {
+            "power-off-monitors"
+        };
+        crate::run_command(format!("niri msg action {}", action));
     }
 
     // Fade surfaces on all outputs have finished fading out
@@ -162,6 +181,7 @@ impl State {
             }
             output.fade_surface = None;
         }
+        self.niri_set_monitors_power(false);
 
         let timer = timer::Timer::from_duration(LOCK_SCREEN_DELAY);
         self.loop_handle
@@ -276,13 +296,23 @@ fn main() {
         .bind::<wp_viewporter::WpViewporter, _, _>(&qh, 1..=1, ())
         .unwrap();
 
+    // Optional as well (niri lacks it): the fade-to-black surface then uses
+    // a 1x1 wl_shm buffer instead, see fade_black.rs.
     let single_pixel_buffer_manager = globals
         .bind::<wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1, _, _>(
             &qh,
             1..=1,
             (),
         )
-        .unwrap();
+        .inspect_err(|err| {
+            log::warn!(
+                "no wp-single-pixel-buffer global; fading to black through wl_shm instead: {}",
+                err
+            )
+        })
+        .ok();
+
+    let shm = globals.bind::<wl_shm::WlShm, _, _>(&qh, 1..=1, ()).unwrap();
 
     let config = cosmic_config::Config::new("com.system76.CosmicIdle", 1).unwrap();
     let conf = CosmicIdleConfig::get_entry(&config).unwrap_or_else(|(errs, conf)| {
@@ -305,6 +335,7 @@ fn main() {
             layer_shell,
             viewporter,
             single_pixel_buffer_manager,
+            shm,
             idle_notifier,
             seat,
             qh,
